@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+	"github.com/google/go-cmp/cmp"
 	"github.com/tatsushid/go-fastping"
 	"log"
 	"math/big"
@@ -25,7 +27,8 @@ func main() {
 		limit                     = flag.Int("limit", 0, "Number of IPs you want to pick (default 0, means all)")
 		skipFirst                 = flag.Bool("skip-first", true, "Skip first IP in subnet")
 		skipLast                  = flag.Bool("skip-last", true, "Skip last IP in subnet")
-		addrs                     = make(map[int]net.IP)
+		addrs                     []net.IP
+		ipv4                      bool
 		excludeIpsParsed          = []string{}
 		notInDockerNetworksParsed = []string{}
 		mu                        sync.Mutex
@@ -36,13 +39,30 @@ func main() {
 	ip, ipNet, err := net.ParseCIDR(*subnet)
 
 	if err == nil {
+		ipToV4 := ip.To4()
+		ipv4 = (ipToV4 != nil)
+
+		addrsMaxLen := AddressCount(ipNet)
+		addrs = make([]net.IP, 0, addrsMaxLen)
+
 		nIp := ip
 		p := fastping.NewPinger()
 		p.MaxRTT = time.Duration(*pingMaxTtlMs) * time.Millisecond
 		p.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
-			ipInt := Ipv4ToInt(addr.IP)
 			mu.Lock()
-			delete(addrs, ipInt)
+
+			ipIdx := -1
+			for idx, ip := range addrs {
+				if cmp.Equal(ip, addr.IP) {
+					ipIdx = idx
+					break
+				}
+			}
+
+			if ipIdx > -1 {
+				addrs[ipIdx] = addrs[len(addrs)-1]
+				addrs = addrs[:len(addrs)-1]
+			}
 			mu.Unlock()
 		}
 
@@ -70,7 +90,12 @@ func main() {
 				}
 
 				for _, ct := range ntwk.Containers {
-					ctIp, _, err := net.ParseCIDR(ct.IPv4Address)
+					var ctIp net.IP
+					if ipv4 {
+						ctIp, _, err = net.ParseCIDR(ct.IPv4Address)
+					} else {
+						ctIp, _, err = net.ParseCIDR(ct.IPv6Address)
+					}
 					if err == nil {
 						if ipNet.Contains(ctIp) {
 							usedIpsInDocker = append(usedIpsInDocker, ctIp.String())
@@ -87,18 +112,17 @@ func main() {
 		usedIpsInDockerLen := len(usedIpsInDocker)
 
 		if *skipFirst {
-			nIp = NextIp(nIp, 1)
+			nIp = Inc(nIp)
 		}
 		_, lastIp := AddressRange(ipNet)
 
-		for ; ipNet.Contains(nIp); nIp = NextIp(nIp, 1) {
+		for ; ipNet.Contains(nIp); nIp = Inc(nIp) {
 			if *skipLast && (lastIp.String() == nIp.String()) {
 				break
 			}
 
 			if sort.SearchStrings(excludeIpsParsed, nIp.String()) >= excludeIpsParsedLen && sort.SearchStrings(usedIpsInDocker, nIp.String()) >= usedIpsInDockerLen {
-
-				addrs[Ipv4ToInt(nIp)] = nIp
+				addrs = append(addrs, nIp)
 				p.AddIP(nIp.String())
 			}
 		}
@@ -108,21 +132,19 @@ func main() {
 			log.Fatalf("%s", err)
 		}
 
-		addrsKeys := make([]int, 0, len(addrs))
-		for k := range addrs {
-			addrsKeys = append(addrsKeys, k)
-		}
-		sort.Ints(addrsKeys)
+		sort.Slice(addrs, func(i, j int) bool {
+			return (bytes.Compare(addrs[i], addrs[j]) < 0)
+		})
 
 		if *limit == 0 {
-			for _, ipInt := range addrsKeys {
-				fmt.Printf("%s\n", addrs[ipInt])
+			for _, ip := range addrs {
+				fmt.Printf("%s\n", ip)
 			}
 		} else {
 			i := 0
-			for _, ipInt := range addrsKeys {
+			for _, ip := range addrs {
 				if i < *limit {
-					fmt.Printf("%s\n", addrs[ipInt])
+					fmt.Printf("%s\n", ip)
 					i++
 				} else {
 					break
@@ -173,13 +195,6 @@ func IpToInt(ip net.IP) (*big.Int, int) {
 	}
 }
 
-func Ipv4ToInt(ip net.IP) int {
-	val := big.Int{}
-	val.SetBytes([]byte(ip.To4()))
-
-	return int(val.Int64())
-}
-
 func IntToIP(ipInt *big.Int, bits int) net.IP {
 	ipBytes := ipInt.Bytes()
 	ret := make([]byte, bits/8)
@@ -192,14 +207,28 @@ func IntToIP(ipInt *big.Int, bits int) net.IP {
 	return net.IP(ret)
 }
 
-func NextIp(ip net.IP, inc uint) net.IP {
-	i := ip.To4()
-	v := uint(i[0])<<24 + uint(i[1])<<16 + uint(i[2])<<8 + uint(i[3])
-	v += inc
-	v3 := byte(v & 0xFF)
-	v2 := byte((v >> 8) & 0xFF)
-	v1 := byte((v >> 16) & 0xFF)
-	v0 := byte((v >> 24) & 0xFF)
+func AddressCount(network *net.IPNet) uint64 {
+	prefixLen, bits := network.Mask.Size()
+	return 1 << (uint64(bits) - uint64(prefixLen))
+}
 
-	return net.IPv4(v0, v1, v2, v3)
+func Inc(IP net.IP) net.IP {
+	IP = checkIPv4(IP)
+	incIP := make([]byte, len(IP))
+	copy(incIP, IP)
+	for j := len(incIP) - 1; j >= 0; j-- {
+		incIP[j]++
+		if incIP[j] > 0 {
+			break
+		}
+	}
+	return incIP
+}
+
+func checkIPv4(ip net.IP) net.IP {
+	// Go for some reason allocs IPv6len for IPv4 so we have to correct it
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	return ip
 }
