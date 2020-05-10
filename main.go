@@ -25,7 +25,7 @@ func main() {
 		limit                     = flag.Int("limit", 0, "Number of IPs you want to pick (default 0, means all)")
 		skipFirst                 = flag.Bool("skip-first", true, "Skip first IP in subnet")
 		skipLast                  = flag.Bool("skip-last", true, "Skip last IP in subnet")
-		addrs                     = make(map[string]*net.IP)
+		addrs                     = make(map[int]net.IP)
 		excludeIpsParsed          = []string{}
 		notInDockerNetworksParsed = []string{}
 		mu                        sync.Mutex
@@ -40,8 +40,9 @@ func main() {
 		p := fastping.NewPinger()
 		p.MaxRTT = time.Duration(*pingMaxTtlMs) * time.Millisecond
 		p.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
+			ipInt := Ipv4ToInt(addr.IP)
 			mu.Lock()
-			delete(addrs, addr.IP.String())
+			delete(addrs, ipInt)
 			mu.Unlock()
 		}
 
@@ -96,7 +97,8 @@ func main() {
 			}
 
 			if sort.SearchStrings(excludeIpsParsed, nIp.String()) >= excludeIpsParsedLen && sort.SearchStrings(usedIpsInDocker, nIp.String()) >= usedIpsInDockerLen {
-				addrs[nIp.String()] = &nIp
+
+				addrs[Ipv4ToInt(nIp)] = nIp
 				p.AddIP(nIp.String())
 			}
 		}
@@ -106,15 +108,21 @@ func main() {
 			log.Fatalf("%s", err)
 		}
 
+		addrsKeys := make([]int, 0, len(addrs))
+		for k := range addrs {
+			addrsKeys = append(addrsKeys, k)
+		}
+		sort.Ints(addrsKeys)
+
 		if *limit == 0 {
-			for ipStr, _ := range addrs {
-				fmt.Printf("%s\n", ipStr)
+			for _, ipInt := range addrsKeys {
+				fmt.Printf("%s\n", addrs[ipInt])
 			}
 		} else {
 			i := 0
-			for ipStr, _ := range addrs {
+			for _, ipInt := range addrsKeys {
 				if i < *limit {
-					fmt.Printf("%s\n", ipStr)
+					fmt.Printf("%s\n", addrs[ipInt])
 					i++
 				} else {
 					break
@@ -163,6 +171,13 @@ func IpToInt(ip net.IP) (*big.Int, int) {
 	} else {
 		panic(fmt.Errorf("Unsupported address length %d", len(ip)))
 	}
+}
+
+func Ipv4ToInt(ip net.IP) int {
+	val := big.Int{}
+	val.SetBytes([]byte(ip.To4()))
+
+	return int(val.Int64())
 }
 
 func IntToIP(ipInt *big.Int, bits int) net.IP {
