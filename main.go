@@ -12,6 +12,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,7 +20,7 @@ func main() {
 	var (
 		subnet                    = flag.String("subnet", "192.168.0.0/24", "Subnet to look for free IPs")
 		excludeIps                = flag.String("exclude-ips", "", "IPs you want to ignore (separated by comma if you want to specify several ones)")
-		pingMaxTtlMs              = flag.Int64("ping-max-ttl-ms", 500, "Ping max ttl in ms (500ms by default)")
+		pingMaxTtlMs              = flag.Int64("ping-max-ttl-ms", 2000, "Ping max ttl in ms (2000ms by default)")
 		notInDockerNetworks       = flag.String("not-used-in-docker-networks", "", "Docker network to look for already used IPs (separated by comma if you want to specify several ones)")
 		limit                     = flag.Int("limit", 0, "Number of IPs you want to pick (default 0, means all)")
 		skipFirst                 = flag.Bool("skip-first", true, "Skip first IP in subnet")
@@ -27,6 +28,7 @@ func main() {
 		addrs                     = make(map[string]*net.IP)
 		excludeIpsParsed          = []string{}
 		notInDockerNetworksParsed = []string{}
+		mu                        sync.Mutex
 	)
 
 	flag.Parse()
@@ -38,7 +40,9 @@ func main() {
 		p := fastping.NewPinger()
 		p.MaxRTT = time.Duration(*pingMaxTtlMs) * time.Millisecond
 		p.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
+			mu.Lock()
 			delete(addrs, addr.IP.String())
+			mu.Unlock()
 		}
 
 		if *excludeIps != "" {
@@ -94,19 +98,28 @@ func main() {
 			if sort.SearchStrings(excludeIpsParsed, nIp.String()) >= excludeIpsParsedLen && sort.SearchStrings(usedIpsInDocker, nIp.String()) >= usedIpsInDockerLen {
 				addrs[nIp.String()] = &nIp
 				p.AddIP(nIp.String())
-				err = p.Run()
-				if err != nil {
-					log.Fatalf("%s", err)
-				}
-				p.RemoveIP(nIp.String())
-				if *limit > 0 && len(addrs) >= *limit {
-					break
-				}
 			}
 		}
 
-		for ipStr, _ := range addrs {
-			fmt.Printf("%s\n", ipStr)
+		err = p.Run()
+		if err != nil {
+			log.Fatalf("%s", err)
+		}
+
+		if *limit == 0 {
+			for ipStr, _ := range addrs {
+				fmt.Printf("%s\n", ipStr)
+			}
+		} else {
+			i := 0
+			for ipStr, _ := range addrs {
+				if i < *limit {
+					fmt.Printf("%s\n", ipStr)
+					i++
+				} else {
+					break
+				}
+			}
 		}
 
 	} else {
