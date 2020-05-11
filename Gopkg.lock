@@ -77,7 +77,7 @@
   branch = "master"
   name = "golang.org/x/sys"
   packages = ["internal/unsafeheader","unix","windows"]
-  revision = "6aff5f38e54f06f432ddfd9b4af5bf0de052bc08"
+  revision = "7e40ca221e254089b05fb9efcd69844a57f6a367"
 
 [solve-meta]
   analyzer-name = "dep"
