@@ -18,20 +18,25 @@ import (
 	"time"
 )
 
+type PingBulkResult struct {
+	Processed uint
+	Unreached uint
+}
+
 func main() {
 	var (
 		subnet                    = flag.String("subnet", "192.168.0.0/24", "Subnet to look for free IPs")
 		excludeIps                = flag.String("exclude-ips", "", "IPs you want to ignore (separated by comma if you want to specify several ones)")
 		pingMaxTtlMs              = flag.Int64("ping-max-ttl-ms", 2000, "Ping max ttl in ms (2000ms by default)")
 		notInDockerNetworks       = flag.String("not-used-in-docker-networks", "", "Docker network to look for already used IPs (separated by comma if you want to specify several ones)")
-		limit                     = flag.Int("limit", 0, "Number of IPs you want to pick (default 0, means all)")
+		limit                     = flag.Uint64("limit", 0, "Number of IPs you want to pick (default 0, means all)")
 		skipFirst                 = flag.Bool("skip-first", true, "Skip first IP in subnet")
 		skipLast                  = flag.Bool("skip-last", true, "Skip last IP in subnet")
-		addrs                     []net.IP
+		bulkSize                  = flag.Uint("bulk-size", 20, "Ping concurrency")
+		ipChan                    chan net.IP
 		ipv4                      bool
 		excludeIpsParsed          = []string{}
 		notInDockerNetworksParsed = []string{}
-		mu                        sync.Mutex
 	)
 
 	flag.Parse()
@@ -39,32 +44,18 @@ func main() {
 	ip, ipNet, err := net.ParseCIDR(*subnet)
 
 	if err == nil {
-		ipToV4 := ip.To4()
-		ipv4 = (ipToV4 != nil)
+		ipv4 = (nil != ip.To4())
 
-		addrsMaxLen := AddressCount(ipNet)
-		addrs = make([]net.IP, 0, addrsMaxLen)
+		ipChan = make(chan net.IP, 5)
+		procChan := make(chan PingBulkResult, 5)
+
+		if *limit > 0 {
+			if *limit < uint64(*bulkSize) {
+				*bulkSize = uint(*limit)
+			}
+		}
 
 		nIp := ip
-		p := fastping.NewPinger()
-		p.MaxRTT = time.Duration(*pingMaxTtlMs) * time.Millisecond
-		p.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
-			mu.Lock()
-
-			ipIdx := -1
-			for idx, ip := range addrs {
-				if cmp.Equal(ip, addr.IP) {
-					ipIdx = idx
-					break
-				}
-			}
-
-			if ipIdx > -1 {
-				addrs[ipIdx] = addrs[len(addrs)-1]
-				addrs = addrs[:len(addrs)-1]
-			}
-			mu.Unlock()
-		}
 
 		if *excludeIps != "" {
 			excludeIpsParsed = strings.Split(*excludeIps, ",")
@@ -116,44 +107,177 @@ func main() {
 		}
 		_, lastIp := AddressRange(ipNet)
 
+		go BulkPingIps(ipChan, procChan, time.Duration(*pingMaxTtlMs)*time.Millisecond, *bulkSize, *limit)
+
+		var (
+			count, processed, unreached uint64
+			batch, n                    uint
+		)
+
+		count = 0
+		batch = 0
+		processed = 0
+		unreached = 0
+
 		for ; ipNet.Contains(nIp); nIp = Inc(nIp) {
 			if *skipLast && (lastIp.String() == nIp.String()) {
 				break
 			}
 
 			if sort.SearchStrings(excludeIpsParsed, nIp.String()) >= excludeIpsParsedLen && sort.SearchStrings(usedIpsInDocker, nIp.String()) >= usedIpsInDockerLen {
-				addrs = append(addrs, nIp)
-				p.AddIP(nIp.String())
+
+				if *limit > 0 && unreached >= *limit {
+					break
+				}
+
+				if batch == *bulkSize {
+					n = 0
+
+					for n < *bulkSize {
+						select {
+						case bRes, more := <-procChan:
+							if more {
+								n += bRes.Processed
+								unreached += uint64(bRes.Unreached)
+							}
+						default:
+						}
+					}
+					processed += uint64(*bulkSize)
+					batch = 0
+				}
+				ipChan <- nIp
+				batch++
+				count++
 			}
 		}
 
-		err = p.Run()
-		if err != nil {
-			log.Fatalf("%s", err)
-		}
-
-		sort.Slice(addrs, func(i, j int) bool {
-			return (bytes.Compare(addrs[i], addrs[j]) < 0)
-		})
-
-		if *limit == 0 {
-			for _, ip := range addrs {
-				fmt.Printf("%s\n", ip)
-			}
-		} else {
-			i := 0
-			for _, ip := range addrs {
-				if i < *limit {
-					fmt.Printf("%s\n", ip)
-					i++
+		close(ipChan)
+		for processed < count {
+			select {
+			case bRes, more := <-procChan:
+				if more {
+					processed += uint64(bRes.Processed)
+					unreached += uint64(bRes.Unreached)
 				} else {
 					break
 				}
+			default:
 			}
 		}
+		close(procChan)
 
 	} else {
 		log.Fatalf("%s", err)
+	}
+}
+
+func BulkPingIps(ipChan chan net.IP, procChan chan PingBulkResult, pingMaxTtlMs time.Duration, bulkSize uint, limit uint64) {
+
+	var (
+		mu    sync.Mutex
+		addrs []net.IP
+	)
+
+	addrs = make([]net.IP, 0, bulkSize)
+
+	p := fastping.NewPinger()
+	p.MaxRTT = pingMaxTtlMs
+	p.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
+		mu.Lock()
+
+		ipIdx := -1
+		for idx, ip := range addrs {
+			if cmp.Equal(ip, addr.IP) {
+				ipIdx = idx
+				break
+			}
+		}
+
+		if ipIdx > -1 {
+			addrs[ipIdx] = addrs[len(addrs)-1]
+			addrs = addrs[:len(addrs)-1]
+		}
+		mu.Unlock()
+		p.RemoveIPAddr(addr)
+	}
+
+	var (
+		totalUnreached uint64
+		batch          uint
+	)
+	totalUnreached = 0
+	batch = 0
+
+	for {
+		select {
+		case ip, more := <-ipChan:
+
+			if more {
+				addrs = append(addrs, ip)
+				p.AddIP(ip.String())
+				batch++
+
+				if batch == bulkSize {
+					err := p.Run()
+					if err != nil {
+						log.Fatalf("%s", err)
+					}
+					batch = 0
+
+					sort.Slice(addrs, func(i, j int) bool {
+						return (bytes.Compare(addrs[i], addrs[j]) < 0)
+					})
+
+					var (
+						unreached uint
+					)
+
+					unreached = 0
+					for _, addr := range addrs {
+						if limit > 0 {
+							if totalUnreached < limit {
+								fmt.Printf("%s\n", addr)
+							}
+						} else {
+							fmt.Printf("%s\n", addr)
+						}
+						p.RemoveIP(addr.String())
+						unreached++
+						totalUnreached++
+					}
+
+					addrs = addrs[:0]
+					procChan <- PingBulkResult{bulkSize, unreached}
+				}
+
+			} else {
+				var (
+					processed, unreached uint
+				)
+
+				processed = uint(len(addrs))
+				err := p.Run()
+				if err != nil {
+					log.Fatalf("%s", err)
+				}
+				unreached = 0
+				for _, addr := range addrs {
+					if limit > 0 {
+						if totalUnreached < limit {
+							fmt.Printf("%s\n", addr)
+						}
+					} else {
+						fmt.Printf("%s\n", addr)
+					}
+					unreached++
+					totalUnreached++
+				}
+				procChan <- PingBulkResult{processed, unreached}
+				break
+			}
+		default:
+		}
 	}
 }
 
