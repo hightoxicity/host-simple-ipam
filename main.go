@@ -49,10 +49,8 @@ func main() {
 		ipChan = make(chan net.IP, 5)
 		procChan := make(chan PingBulkResult, 5)
 
-		if *limit > 0 {
-			if *limit < uint64(*bulkSize) {
-				*bulkSize = uint(*limit)
-			}
+		if *limit > 0 && *limit < uint64(*bulkSize) {
+			*bulkSize = uint(*limit)
 		}
 
 		nIp := ip
@@ -263,11 +261,7 @@ func BulkPingIps(ipChan chan net.IP, procChan chan PingBulkResult, pingMaxTtlMs 
 				}
 				unreached = 0
 				for _, addr := range addrs {
-					if limit > 0 {
-						if totalUnreached < limit {
-							fmt.Printf("%s\n", addr)
-						}
-					} else {
+					if limit == 0 || totalUnreached < limit {
 						fmt.Printf("%s\n", addr)
 					}
 					unreached++
