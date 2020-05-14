@@ -29,10 +29,11 @@ func main() {
 		excludeIps                = flag.String("exclude-ips", "", "IPs you want to ignore (separated by comma if you want to specify several ones)")
 		pingMaxTtlMs              = flag.Int64("ping-max-ttl-ms", 2000, "Ping max ttl in ms (2000ms by default)")
 		notInDockerNetworks       = flag.String("not-used-in-docker-networks", "", "Docker network to look for already used IPs (separated by comma if you want to specify several ones)")
-		limit                     = flag.Uint64("limit", 0, "Number of IPs you want to pick (default 0, means all)")
+		limit                     = flag.Uint64("limit", 0, "Number of IPs you want to pick/limit returned interfaces count in get-including-interface query mode (default 0, means all)")
 		skipFirst                 = flag.Bool("skip-first", true, "Skip first IP in subnet")
 		skipLast                  = flag.Bool("skip-last", true, "Skip last IP in subnet")
 		bulkSize                  = flag.Uint("bulk-size", 20, "Ping concurrency")
+		queryMode                 = flag.String("query-mode", "get-ip", "Query mode (get-ip, get-including-interface)")
 		ipChan                    chan net.IP
 		ipv4                      bool
 		excludeIpsParsed          = []string{}
@@ -44,6 +45,36 @@ func main() {
 	ip, ipNet, err := net.ParseCIDR(*subnet)
 
 	if err == nil {
+		if *queryMode == "get-including-interface" {
+			itfInc := 0
+
+			itfs, err := net.Interfaces()
+			if err == nil {
+				for _, itf := range itfs {
+					itfAddrs, err := itf.Addrs()
+					if err == nil {
+
+						for _, addr := range itfAddrs {
+							ip, _, err := net.ParseCIDR(addr.String())
+							if err == nil {
+								if ipNet.Contains(ip) {
+									if int(*limit) == 0 || itfInc < int(*limit) {
+										fmt.Printf("%s\n", itf.Name)
+									} else {
+										return
+									}
+									itfInc++
+								}
+							}
+						}
+					}
+				}
+			} else {
+				log.Fatalf("%s\n", err)
+			}
+			return
+		}
+
 		ipv4 = (nil != ip.To4())
 
 		ipChan = make(chan net.IP, 5)
@@ -68,13 +99,13 @@ func main() {
 		if len(notInDockerNetworksParsed) > 0 {
 			cli, err := client.NewClientWithOpts(client.FromEnv)
 			if err != nil {
-				log.Fatalf("%s", err)
+				log.Fatalf("%s\n", err)
 			}
 
 			for _, dockerNet := range notInDockerNetworksParsed {
 				ntwk, err := cli.NetworkInspect(context.Background(), dockerNet, types.NetworkInspectOptions{})
 				if err != nil {
-					log.Fatalf("%s", err)
+					log.Fatalf("%s\n", err)
 					continue
 				}
 
@@ -166,7 +197,7 @@ func main() {
 		close(procChan)
 
 	} else {
-		log.Fatalf("%s", err)
+		log.Fatalf("%s\n", err)
 	}
 }
 
@@ -219,7 +250,7 @@ func BulkPingIps(ipChan chan net.IP, procChan chan PingBulkResult, pingMaxTtlMs 
 				if batch == bulkSize {
 					err := p.Run()
 					if err != nil {
-						log.Fatalf("%s", err)
+						log.Fatalf("%s\n", err)
 					}
 					batch = 0
 
@@ -257,7 +288,7 @@ func BulkPingIps(ipChan chan net.IP, procChan chan PingBulkResult, pingMaxTtlMs 
 				processed = uint(len(addrs))
 				err := p.Run()
 				if err != nil {
-					log.Fatalf("%s", err)
+					log.Fatalf("%s\n", err)
 				}
 				unreached = 0
 				for _, addr := range addrs {
