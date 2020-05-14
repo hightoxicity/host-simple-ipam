@@ -23,6 +23,11 @@ type PingBulkResult struct {
 	Unreached uint
 }
 
+const (
+	QueryModeGetFreeIp = "get-free-ip"
+	QueryModeGetRelatatedLocalInterface = "get-related-local-interface"
+)
+
 func main() {
 	var (
 		subnet                    = flag.String("subnet", "192.168.0.0/24", "Subnet to look for free IPs")
@@ -33,7 +38,7 @@ func main() {
 		skipFirst                 = flag.Bool("skip-first", true, "Skip first IP in subnet")
 		skipLast                  = flag.Bool("skip-last", true, "Skip last IP in subnet")
 		bulkSize                  = flag.Uint("bulk-size", 20, "Ping concurrency")
-		queryMode                 = flag.String("query-mode", "get-ip", "Query mode (get-ip, get-including-interface)")
+		queryMode                 = flag.String("query-mode", "get-free-ip", "Query mode (get-free-ip, get-related-local-interface)")
 		ipChan                    chan net.IP
 		ipv4                      bool
 		excludeIpsParsed          = []string{}
@@ -45,7 +50,7 @@ func main() {
 	ip, ipNet, err := net.ParseCIDR(*subnet)
 
 	if err == nil {
-		if *queryMode == "get-including-interface" {
+		if *queryMode == QueryModeGetRelatatedLocalInterface {
 			itfInc := 0
 
 			itfs, err := net.Interfaces()
